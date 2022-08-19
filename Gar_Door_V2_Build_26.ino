@@ -3,31 +3,38 @@
 // Created Dec 1, 2020
 // Created by David Barck
 //
-// 08/15/2022 Added more debugging, coments, changed names of some objects
+// 08/15/2022 Added delay to allow for obstruction startup, added more debugging, coments, changed names of some objects
 // 05/10/2021 Removed interrupt driven timer for blinking the "operate" button - this was just adding unnecessary complication 
 //
-// Garage Door Opener Controller
+// Garage Door Opener/Closer Controller
 //
 // The Micro Controller board is an Arduino Mega
 // There is a separate motor driver board to drive the 2 linear actuators
-// The actuators run at 12 molts
-// The IR "beam break" sensor runs at 23.5 volts (voltage supplied via a boost voltage converted)
+// The actuators run at 12 volts
+//
+// Class Diagram:
+//    DoorPair 
+//      Door1
+//        Actuator1
+//      Door2
+//        Actuator2
+//
 //
 // Open and Close the bifold garage doors using a linear actuator attached to each door. Extending the actuator opens the door, retracting closes the door.
 // The open or close operation is triggered via a momentary button, or a wireless remote control relay, or a wifi controlled relay
 // Each door has open and closed limit switchs to indicate when the door is fully open, or fully closed.
 // (each actuator also has internal limit switchs that stop the actuator if it becomes fully extended or fully retracted)
-// There is an IR "beam break" sensor to detect if there is an obstruction in the door opening
+// There is an IR "beam break" sensor to detect if there is an obstruction in the door opening. The sensor runs at 12 volts and is switched on and off via a transistor and arduino pin
 // 
 // While each door is opening or closing, check the appropriate limit switch . Stop the door when the limit switch is triggered.
-// Stop both doors if:
+// Stop BOTH doors if:
 //    - the button (or remote button) is pressed during door operation
 //    - the IR obstruction sensor is triggered and the door is closing (no need to check for obstruction when the door is opening)
 //    - excess current draw is detected (indicating that one or both doors are jammed)
 //    - very low current is detected (indicating that the actuator has reached the limit of travel - this should never happen)
 //    - the open or closing operation has been running for excess time
 //
-//#define DEBUG
+#define DEBUG
 #include <serialdebug.h>
 #include <debouncedswitch.h>
 
@@ -68,15 +75,17 @@ const byte g_m2PWMD2Pin = 12;
 const byte g_m2In1Pin = 48;   
 const byte g_m2In2Pin = 49;   
 // this pin applies to both actuators
-const byte g_enPin = 39;      // Enable input: when EN is LOW, the both actuator driver ICs are in a low-current sleep mode.
+const byte g_enPin = 39;      // Enable input: when EN is LOW, then both actuator driver ICs are in a low-current sleep mode.
 // end actuator driver board pins
 
 // open-close-stop button //////////////////////////
-const byte g_buttonPin = 33; // momentary button to indicate that both doors should open, close, or stop, triggered when signal goes HIGH
+const byte g_buttonPin = 33; // momentary button to indicate that both doors should open, close, or stop, triggered when signal goes HIGH (the wireless remote and WiFi relay are also wired to this pin)
 
 // obstruciton sensor     //////////////////////////
-const byte g_obstructionSensorPin = 35;      // obstruction detected when signal goes low
-const byte g_onOffObstructionSensorPin = 53; // turns obstruction sensor transmitter and receiver on or off (on = high, off = low)
+const byte g_obstructionSensorPin = 35;                     // obstruction detected when signal goes low
+const byte g_onOffObstructionSensorPin = 52;                // turns obstruction sensor on or off (on = high, off = low)
+const unsigned long g_obstructionSensorStartupMillis = 250; // the time it takes for the obstruction sensor to startup
+unsigned long g_obstructionSensorStartTime = 0;             // millis() time when the obstruction sensor was started
 
 // limit switches and approach sensors //////////////////////////
 // door 1
@@ -91,11 +100,11 @@ const byte g_d2ApproachingOpenPin = 30;   // FUTURE USE: door is approaching ope
 const byte g_d2ApproachingClosedPin = 31; // FUTURE USE: door is approaching closed when signal goes momentarily LOW 
 
 // LEDs
-const byte g_excessCurrentFaultLEDPin = 3 ;  // light if doorStopCause is DOOR_STOPPED_ACTUATOR_EXCESS_CURRENT
+const byte g_excessCurrentFaultLEDPin = 3 ;  // light if doorStopCause is DOOR_STOPPED_ACTUATOR_EXCESS_CURRENT (due to one or both doors are jammed)
 const byte g_doorMovingLEDPin = 4;           // light when door is moving
 const byte g_timeoutFaultLEDPin =  5;        // light if doorStopCause is DOOR_STOPPED_TIMEOUT
-const byte g_obstructionFaultLEDPin =  6;    // light if doorStopCause is DOOR_STOPPED_OBSTRUCTION
-
+const byte g_obstructionFaultLEDPin =  6;    // light if doorStopCause is DOOR_STOPPED_OBSTRUCTION (IR "beam break" sensor is triggered)
+ 
 // end Global pin assignments
 
 ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -287,6 +296,7 @@ class Door {
     bool isUnderMinCurrent = false;
     unsigned long underMinCurrentStartMillis = millis();
     unsigned int underMinCurrentTotalMillis = 0;
+    unsigned long getRuntimeMillis() {return millis() - startMillis;};
     
     doorStatus currStatus = DOOR_STOPPED;  
     doorStopCause currStopCause = DOOR_STOPPED_INIT;
@@ -297,7 +307,7 @@ class Door {
     int dClosedStopDelayMillis;
     bool limitSwitchTriggered = false;                    // set to true as soon as the limit switch is triggered
     unsigned long limitSwitchTriggeredMillis;             // the time is milliseconds when the open or closed limit switch is triggered
-    unsigned long getRuntimeMillis() {return millis() - startMillis;};
+
     void updateStatus(doorStatus status, doorStopCause stopCause);
     void debugPrintStopCause(doorStopCause stopCause);
     void debugPrintStatus(doorStatus status);
@@ -365,7 +375,6 @@ void Door::close() {
   overMaxCurrentTotalMillis = 0;
   isUnderMinCurrent = false;
   underMinCurrentTotalMillis = 0;
-
   doorRampMode = RAMP_UP;
   limitSwitchTriggered = false;
   dActuatorPtr->retract(g_startSpeed);
@@ -382,6 +391,8 @@ void Door::stop(doorStatus status, doorStopCause stopCause) {
   if (isDoorFault()) {
     setDoorFaultLED();
   }
+  digitalWrite(g_onOffObstructionSensorPin, LOW); // turn off the obstruction sensor
+  DEBUG_PRINTLN("g_onOffObstructionSensorPin - 5, LOW");
 }
 
 //
@@ -684,9 +695,11 @@ void DoorPair::close() {
   clearFaultLEDs();
   digitalWrite(g_onOffObstructionSensorPin, HIGH); // turn on the obstruction sensor
   DEBUG_PRINTLN("g_onOffObstructionSensorPin - 1, HIGH");
-
+  g_obstructionSensorStartTime = millis();
+  delay(100); // delay to allow the obstruction sensor to start
   setDoorMovingLEDMode(DM_ON);
   reverseProcessed = false;
+  
   door1Ptr->close();  
   door2Ptr->close();
 }
@@ -782,15 +795,18 @@ void DoorPair::processEvents() {
   if (d1CurrStatus == DOOR_STOPPED) {
     if (d2CurrStatus != DOOR_STOPPED) {
       door2Ptr->stop(DOOR_STOPPED, door1Ptr->getCurrStopCause()); // use the door 1 stop cause for the door 2 stop cause
+      digitalWrite(g_onOffObstructionSensorPin, LOW); // turn off the obstruction sensor
+      DEBUG_PRINTLN("g_onOffObstructionSensorPin - 3, LOW");
+
     } 
     doorsAreStopped = true;
   } else if (d2CurrStatus == DOOR_STOPPED) {
     door1Ptr->stop(DOOR_STOPPED, door2Ptr->getCurrStopCause()); // use the door 2 stop cause for the door 1 stop cause
+    digitalWrite(g_onOffObstructionSensorPin, LOW); // turn off the obstruction sensor
+    DEBUG_PRINTLN("g_onOffObstructionSensorPin - 4, LOW");
     doorsAreStopped = true;
   }
   if (doorsAreStopped) {
-    digitalWrite(g_onOffObstructionSensorPin, LOW); // turn off the obstruction sensor
-    DEBUG_PRINTLN("g_onOffObstructionSensorPin - 3, LOW");
     setDoorMovingLEDMode(DM_OFF);
     if (door1Ptr->getCurrStopCause() == DOOR_STOPPED_ACTUATOR_EXCESS_CURRENT || door2Ptr->getCurrStopCause() == DOOR_STOPPED_ACTUATOR_EXCESS_CURRENT) {
       // one or both doors are drawing excessive current - indicating a jam
@@ -885,8 +901,13 @@ void setup()
   pinMode(g_buttonPin, INPUT); // this pin needs a pull down resistor
   pinMode(g_obstructionSensorPin, INPUT_PULLUP);
   pinMode(g_onOffObstructionSensorPin, OUTPUT);
+  //
   digitalWrite(g_onOffObstructionSensorPin, LOW); // turn off the obstruction sensor
   DEBUG_PRINTLN("g_onOffObstructionSensorPin - 0, LOW");
+  
+  ////////////////////////////for debugging - set the IR sensor power to on 
+  //digitalWrite(g_onOffObstructionSensorPin, HIGH);
+  //////////////////////////////
 
   // limit switch and approaching limit pins
   // door 1
@@ -943,10 +964,13 @@ void setup()
 bool buttonPressProcessed = false;
 void loop()
 {
-  if (obstructionSensorPtr->triggered(millis()) && doorPairPtr->getCurrStatus() == DOOR_CLOSING) { 
+  if (obstructionSensorPtr->triggered(millis()) && doorPairPtr->getCurrStatus() == DOOR_CLOSING) {
     // only react to the obstruction sensor if the door is closing
-    doorPairPtr->stop(DOOR_STOPPED, DOOR_STOPPED_OBSTRUCTION);
-  } else { 
+    if (millis() -  g_obstructionSensorStartTime > g_obstructionSensorStartupMillis) {
+      // only react if the doors have been moving long enough for the obstruction sensor to be fully active
+        doorPairPtr->stop(DOOR_STOPPED, DOOR_STOPPED_OBSTRUCTION);      
+    }
+   } else { 
     if (buttonPtr->triggered(millis())) {
       // only respond to the button press once per button press, buttonPressProcessed will get reset to false when the button is released
       if (!buttonPressProcessed) {
@@ -992,6 +1016,6 @@ void loop()
     }
   }   
   delay(10);
-  // check for limit switches, timeout, excess current, beam break and other events that need to be processed 
+  // check for limit switches, timeout, excess current, and other events that need to be processed 
   doorPairPtr->processEvents(); 
 }

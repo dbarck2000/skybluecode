@@ -8,9 +8,14 @@
 //
 // Garage Door Opener/Closer Controller
 //
-// The Micro Controller board is an Arduino Mega
-// There is a separate motor driver board to drive the 2 linear actuators
-// The actuators run at 12 volts
+// Micro Controller board:
+//   Arduino Mega
+// Motor driver board:
+//   Cytron 10A (?) 5-30V (?) Dual Channel DC Motor Driver, purchsed from robotshop.com
+// Linear actuators:
+//    Metal gear electric Linear actuator 12V, 700mm distance stroke, 2.5A max, purchsed from Aliexpress
+// Photoelectric Obstruction sensor  
+//    TOPENS TC102 Photo Eye Infrared Photocell Beam Sensor for Gate Openers (purchsed from Banggood? - also avail on Amazon)
 //
 // Class Diagram:
 //    ObstructionSensor
@@ -22,10 +27,10 @@
 //
 //
 // Open and Close the bifold garage doors using a linear actuator attached to each door. Extending the actuator opens the door, retracting closes the door.
-// The open or close operation is triggered via a momentary button, or a wireless remote control relay, or a wifi controlled relay
+// The open or close operation is triggered via a momentary button, (a wireless remote control relay and a wifi controlled relay arre also wired to the button)
 // Each door has open and closed limit switchs to indicate when the door is fully open, or fully closed.
 // (each actuator also has internal limit switchs that stop the actuator if it becomes fully extended or fully retracted)
-// There is an IR "beam break" sensor to detect if there is an obstruction in the door opening. The sensor runs at 12 volts and is switched on and off via a transistor and arduino pin
+// There is an IR "beam break" sensor to detect if there is an obstruction in the door opening. The sensor runs at 12 volts and is switched on and off via a relay and arduino pin
 // 
 // While each door is opening or closing, check the appropriate limit switch . Stop the door when the limit switch is triggered.
 // Stop BOTH doors if:
@@ -44,9 +49,9 @@ const unsigned long g_maxRuntimeMillis = 15000; // max run time before timing ou
 const int g_startRampDownMillis = 10000;       // elapsed opening or closing time before starting to ramp the actuator speed down;
 const int g_rampSpeedChange = 1;               // number of steps to increment or decrement the actuator speed when ramping up or ramping down
 const int g_startSpeed = 150;                  // initial actuator speed when opening or closing (0 to 255)
-const int g_maxCurrent = 1500;                 // if current exceeds this value for an extended time, then stop 
+const int g_maxCurrent = 3000;                 // if current exceeds this value for an extended time, then stop 
 const int g_minCurrent = 200;                  // if current falls below this value for an extended time, then consider the door open or closed due to the actuator internal limit switch hit     
-const int g_maxMillisAtOverCurrent = 250;      // max time the current can exceed the max current
+const int g_maxMillisAtOverCurrent = 500;     // max time the current can exceed the max current
 const int g_maxMillisAtUnderCurrent = 250;     // max time the current be under the min current before the door is considered open or closed
 const int g_d1OpenStopDelayMillis = 0;         // milliseconds to delay after the open limit switch is triggered before stopping the actuator
 const int g_d1ClosedStopDelayMillis = 0;       // milliseconds to delay after the closed limit switch is triggered before stopping the actuator
@@ -350,7 +355,7 @@ bool Actuator::isFault() {
 //
 class Door {
   public:
-    Door(Actuator* actuatorPtr, byte openLimitSwPin, byte approachingOpenPin, byte closedLimitSwPin, byte approachingClosedPin, int openStopDelayMillis, int closedStopDelayMillis);
+    Door(int ID, Actuator* actuatorPtr, byte openLimitSwPin, byte approachingOpenPin, byte closedLimitSwPin, byte approachingClosedPin, int openStopDelayMillis, int closedStopDelayMillis);
     void init();
     void open();
     void close();
@@ -371,6 +376,7 @@ class Door {
     DebouncedSwitch* dClosedLimitSwPtr; 
     DebouncedSwitch* dApproachingClosedPtr;
 
+    byte doorID;
     unsigned long startMillis = 0;
     bool isOverMaxCurrent = false;
     unsigned long overMaxCurrentStartMillis = millis();
@@ -393,6 +399,8 @@ class Door {
     void updateStatus(doorStatus status, doorStopCause stopCause);
     void debugPrintStopCause(doorStopCause stopCause);
     void debugPrintStatus(doorStatus status);
+    void debugPrintActuatorCurrent(unsigned int actuatorCurrent);
+
     bool isDoorFault();
     void setDoorFaultLED();
 };
@@ -401,7 +409,8 @@ class Door {
 //
 // Door() 
 //
-Door::Door(Actuator* actuatorPtr, byte openLimitSwPin, byte approachingOpenPin, byte closedLimitSwPin, byte approachingClosedPin, int openStopDelayMillis, int closedStopDelayMillis) {
+Door::Door(int ID, Actuator* actuatorPtr, byte openLimitSwPin, byte approachingOpenPin, byte closedLimitSwPin, byte approachingClosedPin, int openStopDelayMillis, int closedStopDelayMillis) {
+  doorID = ID;
   dActuatorPtr = actuatorPtr;
   dOpenLimitSwPin = openLimitSwPin; 
   dApproachingOpenPin = approachingOpenPin; 
@@ -503,6 +512,7 @@ void Door::updateStatus(doorStatus newStatus, doorStopCause newStopCause) {
 void Door::processEvents() {
   if (currStatus == DOOR_OPENING || currStatus == DOOR_CLOSING) {
     unsigned int actuatorCurrent = dActuatorPtr->getCurrent();
+    debugPrintActuatorCurrent(actuatorCurrent);
     // Check for over max current
     if (actuatorCurrent > g_maxCurrent) {
       if (isOverMaxCurrent) {
@@ -536,7 +546,7 @@ void Door::processEvents() {
       }
     }
     
-    // Check for continious excessive current for more than the max allowed (250 milliseconds)
+    // Check for continious excessive current for more than the max allowed
     if (overMaxCurrentTotalMillis > g_maxMillisAtOverCurrent) {
       DEBUG_PRINT(" overMaxCurrentTotalMillis = ");
       DEBUG_PRINT(overMaxCurrentTotalMillis);
@@ -708,6 +718,19 @@ void Door::debugPrintStatus(doorStatus status) {
       DEBUG_PRINT(")");
       break;
   }
+}
+
+//
+// utility debug function to print the actuator current
+//
+void Door::debugPrintActuatorCurrent(unsigned int actuatorCurrent) {
+    DEBUG_PRINT(doorID);
+    DEBUG_PRINT(", ");
+    DEBUG_PRINT(currStatus);
+    DEBUG_PRINT(", ");
+    DEBUG_PRINT(actuatorCurrent);
+    DEBUG_PRINT(", ");
+    DEBUG_PRINTLN(getRuntimeMillis());
 }
 
 //
@@ -1012,11 +1035,11 @@ void setup()
   
   // create door 1 object
   actuator1Ptr = new Actuator(g_m1FBPin, g_m1SFPin, g_m1PWMD2Pin, g_m1In1Pin, g_m1In2Pin, g_enPin);
-  door1Ptr = new Door(actuator1Ptr, g_d1OpenLimitSwPin, g_d1ApproachingOpenPin, g_d1ClosedLimitSwPin, g_d1ApproachingClosedPin, g_d1OpenStopDelayMillis, g_d1ClosedStopDelayMillis);
+  door1Ptr = new Door(1, actuator1Ptr, g_d1OpenLimitSwPin, g_d1ApproachingOpenPin, g_d1ClosedLimitSwPin, g_d1ApproachingClosedPin, g_d1OpenStopDelayMillis, g_d1ClosedStopDelayMillis);
   
   // create door 2 object
   actuator2Ptr = new Actuator(g_m2FBPin, g_m2SFPin, g_m2PWMD2Pin, g_m2In1Pin, g_m2In2Pin, g_enPin);
-  door2Ptr = new Door(actuator2Ptr, g_d2OpenLimitSwPin, g_d2ApproachingOpenPin, g_d2ClosedLimitSwPin, g_d2ApproachingClosedPin, g_d1OpenStopDelayMillis, g_d1ClosedStopDelayMillis);
+  door2Ptr = new Door(2, actuator2Ptr, g_d2OpenLimitSwPin, g_d2ApproachingOpenPin, g_d2ClosedLimitSwPin, g_d2ApproachingClosedPin, g_d1OpenStopDelayMillis, g_d1ClosedStopDelayMillis);
 
   // create and initialize door pair object
   doorPairPtr = new DoorPair(door1Ptr, door2Ptr, obstructionSensorPtr);
